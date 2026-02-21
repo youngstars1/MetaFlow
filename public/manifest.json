@@ -1,0 +1,27 @@
+{
+    "name": "MetaFlow — Financial Growth",
+    "short_name": "MetaFlow",
+    "description": "Tu compañero de crecimiento financiero. Metas, ahorro, rutinas y gamificación.",
+    "start_url": "/",
+    "display": "standalone",
+    "orientation": "portrait-primary",
+    "background_color": "#0a0e1a",
+    "theme_color": "#06d6a0",
+    "categories": [
+        "finance",
+        "productivity"
+    ],
+    "icons": [
+        {
+            "src": "/vite.svg",
+            "sizes": "any",
+            "type": "image/svg+xml",
+            "purpose": "any maskable"
+        }
+    ],
+    "screenshots": [],
+    "lang": "es",
+    "dir": "ltr",
+    "scope": "/",
+    "id": "metaflow-pwa"
+}
