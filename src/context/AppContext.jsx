@@ -169,41 +169,58 @@ function appReducer(state, action) {
 
 // =================== SUPABASE CLOUD SYNC ===================
 async function loadFromSupabase(userId) {
-    const [goalsRes, txRes, routinesRes, profileRes] = await Promise.all([
-        supabase.from('goals').select('*').eq('user_id', userId).order('created_at'),
-        supabase.from('transactions').select('*').eq('user_id', userId).order('created_at', { ascending: false }),
-        supabase.from('routines').select('*').eq('user_id', userId).order('created_at'),
-        supabase.from('profiles').select('*').eq('user_id', userId).single(),
-    ]);
+    let goalsData = [], txData = [], routinesData = [], profileData = null;
 
-    // Map snake_case → camelCase
-    const goals = (goalsRes.data || []).map(g => ({
-        id: g.id, name: g.name, description: g.description,
-        targetAmount: g.target_amount, currentAmount: g.current_amount,
-        deadline: g.deadline, priority: g.priority, color: g.color, imageUrl: g.image_url,
+    const safe = async (fn, fallback) => { try { return await fn(); } catch { return fallback; } };
+
+    try {
+        const [goalsRes, txRes, routinesRes, profileRes] = await Promise.all([
+            safe(() => supabase.from('goals').select('*').eq('user_id', userId).order('created_at'), { data: [] }),
+            safe(() => supabase.from('transactions').select('*').eq('user_id', userId).order('created_at', { ascending: false }), { data: [] }),
+            safe(() => supabase.from('routines').select('*').eq('user_id', userId).order('created_at'), { data: [] }),
+            safe(() => supabase.from('profiles').select('*').eq('user_id', userId).single(), { data: null }),
+        ]);
+        goalsData = goalsRes?.data || [];
+        txData = txRes?.data || [];
+        routinesData = routinesRes?.data || [];
+        profileData = profileRes?.data || null;
+    } catch (err) {
+        console.warn('[MetaFlow] Error loading from Supabase, using defaults:', err);
+    }
+
+    // Map snake_case → camelCase with null-safety
+    const goals = goalsData.map(g => ({
+        id: g.id, name: g.name || '', description: g.description || '',
+        targetAmount: Number(g.target_amount) || 0, currentAmount: Number(g.current_amount) || 0,
+        deadline: g.deadline || null, priority: g.priority || 'medium', color: g.color || '#00e5c3', imageUrl: g.image_url || null,
         createdAt: g.created_at,
     }));
 
-    const transactions = (txRes.data || []).map(t => ({
-        id: t.id, type: t.type, amount: t.amount, category: t.category,
-        note: t.note, date: t.date, goalId: t.goal_id, decisionType: t.decision_type,
+    const transactions = txData.map(t => ({
+        id: t.id, type: t.type || 'gasto', amount: Number(t.amount) || 0, category: t.category || '',
+        note: t.note || '', date: t.date || t.created_at, goalId: t.goal_id || null, decisionType: t.decision_type || null,
         createdAt: t.created_at,
     }));
 
-    const routines = (routinesRes.data || []).map(r => ({
-        id: r.id, name: r.name, objective: r.objective, category: r.category,
-        frequency: r.frequency, difficulty: r.difficulty, xpValue: r.xp_value,
-        completedDates: r.completed_dates || [], streak: r.streak, createdAt: r.created_at,
+    const routines = routinesData.map(r => ({
+        id: r.id, name: r.name || '', objective: r.objective || '', category: r.category || 'finanzas',
+        frequency: r.frequency || 'daily', difficulty: r.difficulty || 'medium', xpValue: Number(r.xp_value) || 20,
+        completedDates: Array.isArray(r.completed_dates) ? r.completed_dates : [], streak: Number(r.streak) || 0, createdAt: r.created_at,
     }));
 
-    const profile = profileRes.data ? {
-        name: profileRes.data.name || '',
-        currency: profileRes.data.currency || 'CLP',
-        incomeSources: profileRes.data.income_sources || [],
+    const profile = profileData ? {
+        name: profileData.name || '',
+        currency: profileData.currency || 'CLP',
+        incomeSources: Array.isArray(profileData.income_sources) ? profileData.income_sources : [],
     } : initialState.profile;
 
-    const gamification = profileRes.data?.gamification || initialState.gamification;
-    const envelopes = profileRes.data?.envelopes || { enabled: false, rules: [] };
+    const gamification = profileData?.gamification && typeof profileData.gamification === 'object'
+        ? { totalXP: Number(profileData.gamification.totalXP) || 0, xpLog: Array.isArray(profileData.gamification.xpLog) ? profileData.gamification.xpLog : [], earnedBadgeIds: Array.isArray(profileData.gamification.earnedBadgeIds) ? profileData.gamification.earnedBadgeIds : [] }
+        : initialState.gamification;
+
+    const envelopes = profileData?.envelopes && typeof profileData.envelopes === 'object'
+        ? profileData.envelopes
+        : { enabled: false, rules: [] };
 
     return { goals, transactions, routines, profile, gamification, envelopes };
 }
@@ -359,20 +376,27 @@ export function AppProvider({ children }) {
 
 // Background sync — runs after debounce
 async function syncToCloud(state, userId) {
+    // Sync profile + gamification + envelopes
     try {
-        // Sync profile + gamification + envelopes
         await saveProfileToSupabase(state.profile, state.gamification, state.envelopes, userId);
+    } catch (err) { console.warn('[MetaFlow] Profile sync error:', err.message); }
 
-        // Sync goals
-        await Promise.all(state.goals.map(g => saveGoalToSupabase(g, userId)));
+    // Sync goals (individually so one bad goal doesn't block others)
+    for (const g of state.goals) {
+        try { await saveGoalToSupabase(g, userId); }
+        catch (err) { console.warn('[MetaFlow] Goal sync error:', g.id, err.message); }
+    }
 
-        // Sync transactions
-        await Promise.all(state.transactions.map(t => saveTransactionToSupabase(t, userId)));
+    // Sync transactions
+    for (const t of state.transactions) {
+        try { await saveTransactionToSupabase(t, userId); }
+        catch (err) { console.warn('[MetaFlow] Transaction sync error:', t.id, err.message); }
+    }
 
-        // Sync routines
-        await Promise.all(state.routines.map(r => saveRoutineToSupabase(r, userId)));
-    } catch (err) {
-        console.warn('[MetaFlow] Cloud sync error (data safe in localStorage):', err);
+    // Sync routines
+    for (const r of state.routines) {
+        try { await saveRoutineToSupabase(r, userId); }
+        catch (err) { console.warn('[MetaFlow] Routine sync error:', r.id, err.message); }
     }
 }
 
