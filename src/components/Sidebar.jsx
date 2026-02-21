@@ -202,6 +202,7 @@ function Sidebar({ isOpen, onClose }) {
                     <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-primary)' }}>Youngstars</div>
                         <div style={{ fontSize: 9, color: 'var(--text-muted)' }}>Portfolio <ExternalLink size={8} style={{ display: 'inline', verticalAlign: 'middle' }} /></div>
+                        <div style={{ fontSize: 8, color: 'var(--accent-secondary)', marginTop: 2, fontWeight: 700 }}>v2.1 Sync</div>
                     </div>
                 </a>
             </div>
