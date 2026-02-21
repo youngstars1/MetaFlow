@@ -41,7 +41,7 @@ const BADGE_ICONS = {
     Crown, Trophy, Activity, BarChart3, Target, Layers, Heart
 };
 
-const MISSION_ICONS = { Receipt, CheckCircle, PiggyBank, Shield };
+const MISSION_ICONS = { Receipt, CheckCircle, PiggyBank, Shield: ShieldCheck };
 
 // ─── Small stat card shown in hero ─────────
 function HeroStat({ label, value, color, prefix = '' }) {

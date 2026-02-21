@@ -4,7 +4,9 @@ import { generateId } from '../utils/helpers';
 import { XP_REWARDS, calculateLevel, evaluateBadges } from '../utils/gamification';
 import { Finance, Sanitize } from '../utils/security';
 import { getEnvelopes, saveEnvelopes } from '../utils/envelopes';
-import { supabase, isSupabaseConfigured } from '../lib/supabase';
+import { isSupabaseConfigured, supabase } from '../lib/supabase';
+import { hydrationService } from '../lib/hydrationService';
+import { syncManager } from '../lib/syncManager';
 
 const AppContext = createContext();
 
@@ -17,7 +19,6 @@ const initialState = {
     gamification: { totalXP: 0, xpLog: [], earnedBadgeIds: [] },
     isLoaded: false,
     _undoStack: [],
-    _syncing: false,
 };
 
 // =================== STREAK ===================
@@ -46,11 +47,10 @@ function addXP(gamification, amount, action) {
 // =================== REDUCER ===================
 function appReducer(state, action) {
     switch (action.type) {
-        case 'SET_LOADING': return { ...state, _syncing: action.payload };
         case 'LOAD_DATA': return { ...state, ...action.payload, isLoaded: true };
         case 'ADD_XP': return { ...state, gamification: addXP(state.gamification, action.payload, 'MANUAL') };
 
-        // GOALS
+        // ── GOALS ────────────────────────────
         case 'ADD_GOAL': {
             const sanitized = {
                 ...action.payload,
@@ -72,12 +72,15 @@ function appReducer(state, action) {
                     targetAmount: action.payload.targetAmount !== undefined ? Finance.parse(action.payload.targetAmount) : g.targetAmount,
                 } : g),
             };
-        case 'DELETE_GOAL':
+        case 'DELETE_GOAL': {
+            const goalToDelete = state.goals.find(g => g.id === action.payload);
+            syncManager.syncDelete('goals', action.payload);
             return {
                 ...state,
                 goals: state.goals.filter(g => g.id !== action.payload),
-                _undoStack: [...state._undoStack, { type: 'RESTORE_GOAL', data: state.goals.find(g => g.id === action.payload), timestamp: Date.now() }].slice(-10),
+                _undoStack: [...state._undoStack, { type: 'RESTORE_GOAL', data: goalToDelete, timestamp: Date.now() }].slice(-10),
             };
+        }
         case 'RESTORE_GOAL': return { ...state, goals: [...state.goals, action.payload] };
         case 'ADD_SAVINGS_TO_GOAL': {
             const { goalId, amount } = action.payload;
@@ -95,21 +98,24 @@ function appReducer(state, action) {
             };
         }
 
-        // TRANSACTIONS
+        // ── TRANSACTIONS ─────────────────────
         case 'ADD_TRANSACTION': {
             const sanitized = { ...action.payload, id: generateId(), note: Sanitize.html(action.payload.note), amount: Finance.parse(action.payload.amount) };
             const xpGain = state.transactions.length === 0 ? XP_REWARDS.FIRST_TRANSACTION + XP_REWARDS.TRANSACTION_LOGGED : XP_REWARDS.TRANSACTION_LOGGED;
             return { ...state, transactions: [sanitized, ...state.transactions], gamification: addXP(state.gamification, xpGain, 'TRANSACTION_LOGGED') };
         }
-        case 'DELETE_TRANSACTION':
+        case 'DELETE_TRANSACTION': {
+            const txToDelete = state.transactions.find(t => t.id === action.payload);
+            syncManager.syncDelete('transactions', action.payload);
             return {
                 ...state,
                 transactions: state.transactions.filter(t => t.id !== action.payload),
-                _undoStack: [...state._undoStack, { type: 'RESTORE_TRANSACTION', data: state.transactions.find(t => t.id === action.payload), timestamp: Date.now() }].slice(-10),
+                _undoStack: [...state._undoStack, { type: 'RESTORE_TRANSACTION', data: txToDelete, timestamp: Date.now() }].slice(-10),
             };
+        }
         case 'RESTORE_TRANSACTION': return { ...state, transactions: [action.payload, ...state.transactions] };
 
-        // ROUTINES
+        // ── ROUTINES ─────────────────────────
         case 'ADD_ROUTINE': {
             const newRoutine = { ...action.payload, id: action.payload.id || generateId(), name: Sanitize.html(action.payload.name), objective: action.payload.objective ? Sanitize.html(action.payload.objective) : '', streak: 0, completedDates: [], createdAt: new Date().toISOString() };
             return { ...state, routines: [...state.routines, newRoutine], gamification: addXP(state.gamification, XP_REWARDS.GOAL_CREATED, 'ROUTINE_CREATED') };
@@ -123,12 +129,15 @@ function appReducer(state, action) {
                     objective: action.payload.objective !== undefined ? Sanitize.html(action.payload.objective) : r.objective,
                 } : r),
             };
-        case 'DELETE_ROUTINE':
+        case 'DELETE_ROUTINE': {
+            const routineToDelete = state.routines.find(r => r.id === action.payload);
+            syncManager.syncDelete('routines', action.payload);
             return {
                 ...state,
                 routines: state.routines.filter(r => r.id !== action.payload),
-                _undoStack: [...state._undoStack, { type: 'RESTORE_ROUTINE', data: state.routines.find(r => r.id === action.payload), timestamp: Date.now() }].slice(-10),
+                _undoStack: [...state._undoStack, { type: 'RESTORE_ROUTINE', data: routineToDelete, timestamp: Date.now() }].slice(-10),
             };
+        }
         case 'RESTORE_ROUTINE': return { ...state, routines: [...state.routines, action.payload] };
         case 'COMPLETE_ROUTINE': {
             const { id, date, xp } = action.payload;
@@ -148,10 +157,37 @@ function appReducer(state, action) {
             };
         }
 
+        // ── MISC ─────────────────────────────
         case 'SET_ENVELOPES': return { ...state, envelopes: action.payload };
         case 'UPDATE_PROFILE': return { ...state, profile: { ...state.profile, ...action.payload, name: action.payload.name ? Sanitize.html(action.payload.name) : state.profile.name } };
-        case 'SYNC_STATE': return { ...state, ...action.payload };
 
+        // ── SYNC (from Realtime) ─────────────
+        case 'SYNC_UPSERT': {
+            const { table, item } = action.payload;
+            const list = state[table] || [];
+            const exists = list.some(x => x.id === item.id);
+            return {
+                ...state,
+                [table]: exists
+                    ? list.map(x => x.id === item.id ? { ...x, ...item } : x)
+                    : [...list, item],
+            };
+        }
+        case 'SYNC_REMOVE': {
+            const { table, id } = action.payload;
+            return { ...state, [table]: (state[table] || []).filter(x => x.id !== id) };
+        }
+        case 'SYNC_PROFILE': {
+            const { profile, gamification, envelopes } = action.payload;
+            return {
+                ...state,
+                profile: profile || state.profile,
+                gamification: gamification || state.gamification,
+                envelopes: envelopes || state.envelopes,
+            };
+        }
+
+        // ── UNDO ─────────────────────────────
         case 'UNDO_LAST': {
             if (state._undoStack.length === 0) return state;
             const lastAction = state._undoStack[state._undoStack.length - 1];
@@ -167,173 +203,71 @@ function appReducer(state, action) {
     }
 }
 
-// =================== SUPABASE CLOUD SYNC ===================
-async function loadFromSupabase(userId) {
-    let goalsData = [], txData = [], routinesData = [], profileData = null;
-
-    const safe = async (fn, fallback) => { try { return await fn(); } catch { return fallback; } };
-
-    try {
-        const [goalsRes, txRes, routinesRes, profileRes] = await Promise.all([
-            safe(() => supabase.from('goals').select('*').eq('user_id', userId).order('created_at'), { data: [] }),
-            safe(() => supabase.from('transactions').select('*').eq('user_id', userId).order('created_at', { ascending: false }), { data: [] }),
-            safe(() => supabase.from('routines').select('*').eq('user_id', userId).order('created_at'), { data: [] }),
-            safe(() => supabase.from('profiles').select('*').eq('user_id', userId).single(), { data: null }),
-        ]);
-        goalsData = goalsRes?.data || [];
-        txData = txRes?.data || [];
-        routinesData = routinesRes?.data || [];
-        profileData = profileRes?.data || null;
-    } catch (err) {
-        console.warn('[MetaFlow] Error loading from Supabase, using defaults:', err);
-    }
-
-    // Map snake_case → camelCase with null-safety
-    const goals = goalsData.map(g => ({
-        id: g.id, name: g.name || '', description: g.description || '',
-        targetAmount: Number(g.target_amount) || 0, currentAmount: Number(g.current_amount) || 0,
-        deadline: g.deadline || null, priority: g.priority || 'medium', color: g.color || '#00e5c3', imageUrl: g.image_url || null,
-        createdAt: g.created_at,
-    }));
-
-    const transactions = txData.map(t => ({
-        id: t.id, type: t.type || 'gasto', amount: Number(t.amount) || 0, category: t.category || '',
-        note: t.note || '', date: t.date || t.created_at, goalId: t.goal_id || null, decisionType: t.decision_type || null,
-        createdAt: t.created_at,
-    }));
-
-    const routines = routinesData.map(r => ({
-        id: r.id, name: r.name || '', objective: r.objective || '', category: r.category || 'finanzas',
-        frequency: r.frequency || 'daily', difficulty: r.difficulty || 'medium', xpValue: Number(r.xp_value) || 20,
-        completedDates: Array.isArray(r.completed_dates) ? r.completed_dates : [], streak: Number(r.streak) || 0, createdAt: r.created_at,
-    }));
-
-    const profile = profileData ? {
-        name: profileData.name || '',
-        currency: profileData.currency || 'CLP',
-        incomeSources: Array.isArray(profileData.income_sources) ? profileData.income_sources : [],
-    } : initialState.profile;
-
-    const gamification = profileData?.gamification && typeof profileData.gamification === 'object'
-        ? { totalXP: Number(profileData.gamification.totalXP) || 0, xpLog: Array.isArray(profileData.gamification.xpLog) ? profileData.gamification.xpLog : [], earnedBadgeIds: Array.isArray(profileData.gamification.earnedBadgeIds) ? profileData.gamification.earnedBadgeIds : [] }
-        : initialState.gamification;
-
-    const envelopes = profileData?.envelopes && typeof profileData.envelopes === 'object'
-        ? profileData.envelopes
-        : { enabled: false, rules: [] };
-
-    return { goals, transactions, routines, profile, gamification, envelopes };
-}
-
-async function saveGoalToSupabase(goal, userId) {
-    await supabase.from('goals').upsert({
-        id: goal.id, user_id: userId, name: goal.name, description: goal.description || '',
-        target_amount: goal.targetAmount, current_amount: goal.currentAmount,
-        deadline: goal.deadline, priority: goal.priority, color: goal.color || '#00f5d4',
-        image_url: goal.imageUrl, updated_at: new Date().toISOString(),
-    }, { onConflict: 'id' });
-}
-
-async function saveTransactionToSupabase(tx, userId) {
-    await supabase.from('transactions').upsert({
-        id: tx.id, user_id: userId, type: tx.type, amount: tx.amount,
-        category: tx.category || '', note: tx.note || '', date: tx.date,
-        goal_id: tx.goalId || null, decision_type: tx.decisionType || null,
-    }, { onConflict: 'id' });
-}
-
-async function saveRoutineToSupabase(routine, userId) {
-    await supabase.from('routines').upsert({
-        id: routine.id, user_id: userId, name: routine.name, objective: routine.objective || '',
-        category: routine.category || 'finanzas', frequency: routine.frequency || 'daily',
-        difficulty: routine.difficulty || 'medium', xp_value: routine.xpValue || 20,
-        completed_dates: routine.completedDates || [], streak: routine.streak || 0,
-        updated_at: new Date().toISOString(),
-    }, { onConflict: 'id' });
-}
-
-async function saveProfileToSupabase(profile, gamification, envelopes, userId) {
-    await supabase.from('profiles').upsert({
-        user_id: userId, name: profile.name || '', currency: profile.currency || 'CLP',
-        income_sources: profile.incomeSources || [],
-        gamification: gamification, envelopes: envelopes,
-        updated_at: new Date().toISOString(),
-    }, { onConflict: 'user_id' });
-}
-
-async function deleteFromSupabase(table, id) {
-    await supabase.from(table).delete().eq('id', id);
-}
-
 // =================== PROVIDER ===================
 export function AppProvider({ children }) {
     const [state, dispatch] = useReducer(appReducer, initialState);
     const [prevXP, setPrevXP] = useState(0);
     const [userId, setUserId] = useState(null);
-    const saveTimerRef = useRef(null);
+    const isFirstLoad = useRef(true);
 
-    // Watch auth state to trigger cloud sync
+    // ── Step 1: Instant load from localStorage ──────
     useEffect(() => {
-        if (!isSupabaseConfigured()) {
-            // Offline mode: load from localStorage
-            const goals = storage.getGoals();
-            const transactions = storage.getTransactions();
-            const routines = storage.getRoutines();
-            const profile = storage.getProfile();
-            const gamification = storage.get('metaflow_gamification') || initialState.gamification;
-            const envelopes = getEnvelopes();
-            dispatch({ type: 'LOAD_DATA', payload: { goals, transactions, routines, profile, gamification, envelopes } });
-            setPrevXP(gamification.totalXP || 0);
-            return;
-        }
+        const localData = hydrationService.loadLocal();
+        dispatch({ type: 'LOAD_DATA', payload: localData });
+        setPrevXP(localData.gamification?.totalXP || 0);
+    }, []);
 
-        // Watch Supabase auth
+    // ── Step 2: Listen for auth → hydrate from cloud ─
+    useEffect(() => {
+        if (!isSupabaseConfigured()) return;
+
         const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
             const uid = session?.user?.id || null;
             setUserId(uid);
 
-            if (uid) {
-                // User logged in → load from cloud
-                dispatch({ type: 'SET_LOADING', payload: true });
+            if (uid && isFirstLoad.current) {
+                isFirstLoad.current = false;
+
                 try {
-                    const cloudData = await loadFromSupabase(uid);
-                    dispatch({ type: 'LOAD_DATA', payload: cloudData });
-                    setPrevXP(cloudData.gamification?.totalXP || 0);
+                    const { data, source, needsMigration } = await hydrationService.hydrate(uid);
+                    console.log(`[AppContext] Hydrated from: ${source}, migration needed: ${needsMigration}`);
+
+                    if (source !== 'local') {
+                        // Remote or merged data — update state
+                        dispatch({ type: 'LOAD_DATA', payload: data });
+                        setPrevXP(data.gamification?.totalXP || 0);
+                    }
+
+                    // Initialize sync manager
+                    syncManager.init(uid, dispatch);
+
+                    // If migration needed, sync current state to cloud
+                    if (needsMigration) {
+                        syncManager.onStateChange({
+                            ...state,
+                            ...data,
+                        });
+                    }
                 } catch (err) {
-                    console.error('[MetaFlow] Failed to load cloud data:', err);
-                    // Fallback to localStorage
-                    const goals = storage.getGoals();
-                    const transactions = storage.getTransactions();
-                    const routines = storage.getRoutines();
-                    const profile = storage.getProfile();
-                    const gamification = storage.get('metaflow_gamification') || initialState.gamification;
-                    const envelopes = getEnvelopes();
-                    dispatch({ type: 'LOAD_DATA', payload: { goals, transactions, routines, profile, gamification, envelopes } });
-                    setPrevXP(gamification.totalXP || 0);
-                } finally {
-                    dispatch({ type: 'SET_LOADING', payload: false });
+                    console.warn('[AppContext] Hydration failed, continuing with localStorage:', err.message);
                 }
-            } else {
-                // Guest mode → load from localStorage
-                const goals = storage.getGoals();
-                const transactions = storage.getTransactions();
-                const routines = storage.getRoutines();
-                const profile = storage.getProfile();
-                const gamification = storage.get('metaflow_gamification') || initialState.gamification;
-                const envelopes = getEnvelopes();
-                dispatch({ type: 'LOAD_DATA', payload: { goals, transactions, routines, profile, gamification, envelopes } });
-                setPrevXP(gamification.totalXP || 0);
+            } else if (uid) {
+                // Re-init sync on session refresh (token renewal)
+                syncManager.init(uid, dispatch);
             }
         });
 
-        return () => subscription.unsubscribe();
-    }, []);
+        return () => {
+            subscription.unsubscribe();
+            syncManager.destroy();
+        };
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-    // ---- Persistence: debounced save on state change ----
+    // ── Step 3: Persist + Sync on state change ───────
     useEffect(() => {
         if (!state.isLoaded) return;
 
-        // Always save to localStorage as cache
+        // Always save to localStorage (instant, reliable)
         storage.saveGoals(state.goals);
         storage.saveTransactions(state.transactions);
         storage.saveRoutines(state.routines);
@@ -341,15 +275,13 @@ export function AppProvider({ children }) {
         storage.set('metaflow_gamification', state.gamification);
         saveEnvelopes(state.envelopes);
 
-        // If logged in, debounce cloud sync (wait 1.5s after last change)
-        if (userId && isSupabaseConfigured()) {
-            if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-            saveTimerRef.current = setTimeout(() => {
-                syncToCloud(state, userId);
-            }, 1500);
+        // Sync to cloud (debounced, via SyncManager)
+        if (userId) {
+            syncManager.onStateChange(state);
         }
     }, [state, userId]);
 
+    // ── XP tracking ──────────────────────────────────
     const xpGained = useMemo(() =>
         state.isLoaded ? state.gamification.totalXP - prevXP : 0,
         [state.gamification.totalXP, prevXP, state.isLoaded]);
@@ -372,32 +304,6 @@ export function AppProvider({ children }) {
             {children}
         </AppContext.Provider>
     );
-}
-
-// Background sync — runs after debounce
-async function syncToCloud(state, userId) {
-    // Sync profile + gamification + envelopes
-    try {
-        await saveProfileToSupabase(state.profile, state.gamification, state.envelopes, userId);
-    } catch (err) { console.warn('[MetaFlow] Profile sync error:', err.message); }
-
-    // Sync goals (individually so one bad goal doesn't block others)
-    for (const g of state.goals) {
-        try { await saveGoalToSupabase(g, userId); }
-        catch (err) { console.warn('[MetaFlow] Goal sync error:', g.id, err.message); }
-    }
-
-    // Sync transactions
-    for (const t of state.transactions) {
-        try { await saveTransactionToSupabase(t, userId); }
-        catch (err) { console.warn('[MetaFlow] Transaction sync error:', t.id, err.message); }
-    }
-
-    // Sync routines
-    for (const r of state.routines) {
-        try { await saveRoutineToSupabase(r, userId); }
-        catch (err) { console.warn('[MetaFlow] Routine sync error:', r.id, err.message); }
-    }
 }
 
 export function useApp() {
